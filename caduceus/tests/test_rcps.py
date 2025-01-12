@@ -7,11 +7,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
-except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
 from caduceus.modeling_rcps import (
     RCPSEmbedding, RCPSAddNormWrapper, RCPSLMHead, RCPSWrapper
 )
@@ -108,6 +103,11 @@ def test_rcps_wrapper(batch_size, seq_len, d_model, dtype):
 @pytest.mark.parametrize("d_model", [128])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_rcps_add_norm_wrapper(batch_size, seq_len, d_model, dtype):
+    pytest.importorskip(
+        "mamba_ssm.ops.triton.layernorm",
+        reason="RMSNorm from mamba_ssm is required for this test"
+    )
+    from mamba_ssm.ops.triton.layernorm import RMSNorm
     # Set tolerance
     device = torch.device("cuda")
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
