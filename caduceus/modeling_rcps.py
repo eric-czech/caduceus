@@ -2,7 +2,7 @@
 
 """
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Optional, Type
 
 import torch
 from torch import Tensor
@@ -130,7 +130,92 @@ class RCPSAddNormWrapper(RCPSWrapper):
         return x if not prenorm else (x, residual)
 
 
-class RCPSMambaBlock(nn.Module):
+class RCPSBlock(nn.Module):
+    """Block wrapper around RC-equivariant modules to handle RC-equivariant layer normalization and residual connections.
+    
+    Adapted from: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py
+    """
+
+    def __init__(
+            self,
+            dim,
+            block_module: RCPSWrapper,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32=False,
+            # TODO: This appears irrelevant since Mamba never sees this module
+            # device=None,  # Keep for consistency with original Mamba Block
+            # dtype=None,  # Keep for consistency with original Mamba Block
+    ):
+        """Initialize the block wrapper."""
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.block = block_module
+        norm_f = norm_cls(dim)
+        self.norm = norm_f if fused_add_norm else RCPSAddNormWrapper(norm_f)
+        if self.fused_add_norm:
+            assert RMSNorm is not None, "RMSNorm import fails"
+            assert isinstance(
+                self.norm, (nn.LayerNorm, RMSNorm)
+            ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+
+    def forward(
+        self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
+    ):
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            hidden_states: the sequence to the encoder layer (required).
+            residual: hidden_states = Block(LN(residual)).
+            inference_params: inference parameters for block.
+        """
+        if not self.fused_add_norm:
+            hidden_states, residual = self.norm(hidden_states, residual=residual, prenorm=True)
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+
+            hidden_states_fwd, residual_fwd = fused_add_norm_fn(
+                hidden_states[..., hidden_states.shape[-1] // 2:],
+                self.norm.weight,
+                self.norm.bias,
+                residual=residual[..., hidden_states.shape[-1] // 2:] if residual is not None else None,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.norm.eps,
+            )
+
+            hidden_states_rc, residual_rc = fused_add_norm_fn(
+                hidden_states[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]),
+                self.norm.weight,
+                self.norm.bias,
+                residual=residual[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]) if residual is not None else None,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.norm.eps,
+            )
+            hidden_states = torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
+            residual = torch.cat([residual_fwd, residual_rc.flip(dims=[-2, -1])], dim=-1)
+        hidden_states = self.block(hidden_states, inference_params=inference_params)
+        return hidden_states, residual
+
+    
+    # TODO: This appears irrelevant since Mamba never sees this module
+    # def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    #     """Allocate inference cache for mixer.
+
+    #     Keep for compatibility with original Mamba Block.
+    #     """
+    #     return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+    
+class RCPSMambaBlock(RCPSBlock):
+    
+    def __init__(self, dim: int, mixer_cls: Type["BiMambaWrapper"], norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False):
+        super().__init__(dim, RCPSWrapper(mixer_cls(dim)), norm_cls, fused_add_norm, residual_in_fp32)
+
+class RCPSMambaBlockLegacy(nn.Module):
     def __init__(
             self,
             dim,
