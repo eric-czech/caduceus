@@ -2,7 +2,9 @@
 
 """
 from collections import OrderedDict
+import inspect
 from typing import Any, Optional, Type
+from transformers.models.bert import BertConfig, BertLayer
 
 import torch
 from torch import Tensor
@@ -198,8 +200,12 @@ class RCPSBlock(nn.Module):
             )
             hidden_states = torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
             residual = torch.cat([residual_fwd, residual_rc.flip(dims=[-2, -1])], dim=-1)
-        hidden_states = self.block(hidden_states, inference_params=inference_params)
+        hidden_states = self._apply_block(hidden_states, inference_params=inference_params)
         return hidden_states, residual
+
+    def _apply_block(self, hidden_states: Tensor, **_: Any) -> Tensor:
+        """Override in subclasses if neccessary to control how block modules are invoked."""
+        return self.block(hidden_states)
 
     
     # TODO: This appears irrelevant since Mamba never sees this module
@@ -215,6 +221,35 @@ class RCPSMambaBlock(RCPSBlock):
     def __init__(self, dim: int, mixer_cls: Type["BiMambaWrapper"], norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False):
         super().__init__(dim, RCPSWrapper(mixer_cls(dim)), norm_cls, fused_add_norm, residual_in_fp32)
 
+    def _apply_block(self, hidden_states: Tensor, inference_params=None, **_: Any) -> Tensor:
+        """Override in subclasses if neccessary to control how block modules are invoked."""
+        return self.block(hidden_states, inference_params=inference_params)
+
+class BertBlock(BertLayer):
+    """BertLayer subclass that returns only the first output from forward pass."""
+    
+    def forward(self, *args: Any, **kwargs: Any) -> Tensor:
+        outputs = super().forward(*args, **kwargs)
+        assert isinstance(outputs, tuple), f"BertLayer must return a tuple; got {type(outputs)}"
+        assert len(outputs) >= 1, f"BertLayer must not return empty tuple; got {len(outputs)} outputs"
+        assert isinstance(outputs[0], Tensor), f"BertLayer must return a tensor; got {type(outputs[0])}"
+        return outputs[0]
+
+
+class RCPSBertBlock(RCPSBlock):
+    """BERT block with RCPS support using Hugging Face `BertLayer`."""
+
+    def __init__(
+            self,
+            config: BertConfig,
+            *,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32=False,
+    ):
+        rcps_bert_block = RCPSWrapper(BertBlock(config))
+        super().__init__(config.hidden_size, rcps_bert_block, norm_cls, fused_add_norm, residual_in_fp32)
+    
 class RCPSMambaBlockLegacy(nn.Module):
     def __init__(
             self,

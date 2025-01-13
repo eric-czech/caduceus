@@ -5,8 +5,9 @@
 import inspect
 import math
 from functools import partial
-from typing import Optional, Tuple, Union, Any, Protocol
+from typing import Literal, Optional, Tuple, Union, Any, Protocol
 
+from transformers.models.bert import BertConfig
 import torch
 from mamba_ssm.modules.mamba_simple import Mamba
 try:
@@ -27,25 +28,26 @@ except ImportError:
         RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 from .configuration_caduceus import CaduceusConfig
-from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock
+from .modeling_rcps import BertBlock, RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock, RCPSBertBlock
 
 
-def create_block(
-        d_model,
-        ssm_cfg=None,
-        norm_epsilon=1e-5,
-        rms_norm=False,
-        residual_in_fp32=False,
-        fused_add_norm=False,
-        layer_idx=None,
-        bidirectional=True,
-        bidirectional_strategy="add",
-        bidirectional_weight_tie=True,
-        rcps=False,
-        device=None,
-        dtype=None,
-):
-    """Create Caduceus block.
+def create_mamba_block(
+    d_model: int,
+    *,
+    layer_idx: int | None=None,
+    ssm_cfg: dict[str, Any] | None=None,
+    norm_epsilon: float=1e-5,
+    rms_norm: bool=False,
+    residual_in_fp32: bool=False,
+    fused_add_norm: bool=False,
+    bidirectional: bool=True,
+    bidirectional_strategy: Literal["add", "ew_multiply"] | None="add",
+    bidirectional_weight_tie: bool=True,
+    rcps: bool=False,
+    device: Any | None=None,
+    dtype: Any | None=None,
+) -> nn.Module:
+    """Create Caduceus Mamba block.
 
     Adapted from: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py
     """
@@ -82,6 +84,63 @@ def create_block(
         )
     block.layer_idx = layer_idx
     return block
+
+def create_bert_block(
+    d_model: int,
+    *,
+    layer_idx: int | None=None,
+    num_attention_heads: int = 12,
+    attention_dropout: float = 0.1,
+    hidden_dropout: float = 0.1,
+    norm_epsilon: float = 1e-5,
+    rms_norm: bool = False,
+    residual_in_fp32: bool = False,
+    fused_add_norm: bool = False,
+    rcps: bool = False,
+    device: Any | None=None,
+    dtype: Any | None=None,
+) -> nn.Module:
+    """Create Caduceus BERT block."""
+    factory_kwargs = {"device": device, "dtype": dtype}
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+    )
+    config = BertConfig(
+        hidden_size=d_model,
+        num_attention_heads=num_attention_heads,
+        attention_probs_dropout_prob=attention_dropout,
+        hidden_dropout_prob=hidden_dropout,
+    )
+    if rcps:
+        block = RCPSBertBlock(
+            config, norm_cls=norm_cls, fused_add_norm=fused_add_norm, residual_in_fp32=residual_in_fp32
+        )
+    else:
+        block = BertBlock(config)
+    block = block.to(**factory_kwargs)
+    block.layer_idx = layer_idx
+    return block
+
+def create_block(
+    d_model: int,
+    *,
+    block_type: Literal["mamba", "bert"] = "mamba",
+    **kwargs,
+) -> nn.Module:
+    """Create Caduceus block.
+
+    Args:
+        block_type: Type of block to create, either "mamba" or "bert".
+        kwargs: Keyword arguments for either:
+            - [create_mamba_block](caduceus.modeling_caduceus.create_mamba_block)
+            - [create_bert_block](caduceus.modeling_caduceus.create_bert_block).
+    """
+    if block_type not in ["mamba", "bert"]:
+        raise ValueError(f"Invalid block type: {block_type!r}")
+    if block_type == "mamba":
+        return create_mamba_block(d_model, **kwargs)
+    else:
+        return create_bert_block(d_model, **kwargs)
 
 
 class BiMambaWrapper(nn.Module):
@@ -200,6 +259,45 @@ class MCGCProtocol(Protocol):
         """
 
 class CaduceusMixerModel(nn.Module, HFGCProtocol, MCGCProtocol):
+
+    @staticmethod
+    def get_transformer_layers(n_layer: int, transformer_ratio: float) -> set[int]:
+        """Calculate which layers should be transformers based on the ratio.
+        
+        Args:
+            n_layer: Total number of layers in the model
+            transformer_ratio: Ratio of transformer layers (0.0 = all mamba, 1.0 = all transformer)
+            
+        Returns:
+            Set of layer indices that should be transformers
+
+        Examples:
+            Layer distribution (T=Transformer, M=Mamba):
+            --------------------------------------------------
+            n_layer= 8, ratio=0.00 ( 0 transformers): MMMMMMMM
+            n_layer= 8, ratio=0.25 ( 2 transformers): TMMMMMMT
+            n_layer= 8, ratio=0.50 ( 4 transformers): TMTMMTMT
+            n_layer= 8, ratio=0.75 ( 6 transformers): TTMTTMTT
+            n_layer= 8, ratio=1.00 ( 8 transformers): TTTTTTTT
+            n_layer=16, ratio=0.25 ( 4 transformers): TMMMMTMMMMTMMMMT
+            n_layer=16, ratio=0.50 ( 8 transformers): TMTMTMTMMTMTMTMT
+            n_layer=16, ratio=0.75 (12 transformers): TTMTTTMTTMTTTMTT
+        """
+        # Handle edge cases first
+        if transformer_ratio <= 0.0:
+            return set()
+        if transformer_ratio >= 1.0:
+            return set(range(n_layer))
+        
+        # Calculate number of transformer layers needed
+        n_transformer = round(n_layer * transformer_ratio)
+        if n_transformer == 0:
+            return set()
+        
+        # Distribute the transformer layers evenly across the range
+        indices = set(round(i * (n_layer - 1) / (n_transformer - 1)) for i in range(n_transformer))
+        return indices
+    
     def __init__(
             self,
             config: CaduceusConfig,
@@ -231,25 +329,41 @@ class CaduceusMixerModel(nn.Module, HFGCProtocol, MCGCProtocol):
                 f"got {config.gradient_checkpointing_stride}."
             )
         
-        self.layers = nn.ModuleList(
-            [
+        transformer_layers = self.get_transformer_layers(config.n_layer, config.transformer_ratio)
+        
+        layers = []
+        for i in range(config.n_layer):
+            default_kwargs = {
+                "layer_idx": i,
+                "norm_epsilon": config.norm_epsilon,
+                "rms_norm": config.rms_norm,
+                "residual_in_fp32": config.residual_in_fp32,
+                "fused_add_norm": config.fused_add_norm,
+                "rcps": config.rcps,
+                **factory_kwargs
+            }
+            if i in transformer_layers:
+                block_type = "bert"
+                block_kwargs = default_kwargs
+            else:
+                block_type = "mamba"
+                block_kwargs = {
+                    **default_kwargs,
+                    **{
+                        "ssm_cfg": config.ssm_cfg,
+                        "bidirectional": config.bidirectional,
+                        "bidirectional_strategy": config.bidirectional_strategy,
+                        "bidirectional_weight_tie": config.bidirectional_weight_tie,
+                    }
+                }
+            layers.append(
                 create_block(
                     config.d_model,
-                    ssm_cfg=config.ssm_cfg,
-                    norm_epsilon=config.norm_epsilon,
-                    rms_norm=config.rms_norm,
-                    residual_in_fp32=config.residual_in_fp32,
-                    fused_add_norm=config.fused_add_norm,
-                    layer_idx=i,
-                    bidirectional=config.bidirectional,
-                    bidirectional_strategy=config.bidirectional_strategy,
-                    bidirectional_weight_tie=config.bidirectional_weight_tie,
-                    rcps=config.rcps,
-                    **factory_kwargs,
+                    block_type=block_type,
+                    **block_kwargs
                 )
-                for i in range(config.n_layer)
-            ]
-        )
+            )
+        self.layers = nn.ModuleList(layers)
 
         norm_f = (nn.LayerNorm if not config.rms_norm else RMSNorm)(
             config.d_model, eps=config.norm_epsilon, **factory_kwargs

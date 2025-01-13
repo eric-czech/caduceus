@@ -16,7 +16,7 @@ from caduceus.modeling_rcps import (
     RCPSEmbedding, RCPSAddNormWrapper, RCPSLMHead, RCPSWrapper
 )
 
-from caduceus.modeling_caduceus import CaduceusConfig, CaduceusMixerModel, CaduceusForMaskedLM, create_block
+from caduceus.modeling_caduceus import CaduceusConfig, CaduceusMixerModel, CaduceusForMaskedLM, create_mamba_block, create_bert_block
 
 
 @pytest.mark.parametrize("batch_size", [4])
@@ -158,7 +158,7 @@ def test_rcps_mamba_block_wrapper(batch_size, seq_len, d_model, bidirectional, f
     }
     factory_kwargs = {"device": device, "dtype": dtype}
 
-    mamba_block = create_block(
+    mamba_block = create_mamba_block(
         d_model,
         ssm_cfg=ssm_cfg,
         norm_epsilon=1e-5,
@@ -183,6 +183,58 @@ def test_rcps_mamba_block_wrapper(batch_size, seq_len, d_model, bidirectional, f
 
     out = mamba_block(x, residual=x)
     rc_out = tuple([torch.flip(r, dims=[-2, -1]) for r in mamba_block(rc_x, residual=rc_x)])
+    for f, r in zip(out, rc_out):
+        assert f.size() == x.size()
+        assert r.size() == x.size()
+        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len", [8])
+@pytest.mark.parametrize("d_model", [16])
+@pytest.mark.parametrize("fused_add_norm", [False])
+@pytest.mark.parametrize("dtype", [torch.float32])
+# @pytest.mark.parametrize("fused_add_norm", [True, False])
+# @pytest.mark.parametrize("dtype", [torch.float16])
+def test_rcps_bert_block_wrapper(batch_size, seq_len, d_model, fused_add_norm, dtype):
+    # Set tolerance
+    device = torch.device("cuda")
+    rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
+    if dtype == torch.bfloat16:
+        rtol, atol = 3e-2, 5e-2
+    # Set seed
+    torch.random.manual_seed(0)
+
+    # Generate random sequence with 2 * d_model channels
+    def rc(x):
+        return torch.flip(x, dims=[-2, -1])
+    x = torch.randn(batch_size, seq_len, d_model * 2, device=device, dtype=dtype)
+    rc_x = rc(x)
+
+    factory_kwargs = {"device": device, "dtype": dtype}
+
+    bert_block = create_bert_block(
+        d_model,
+        num_attention_heads=4,
+        norm_epsilon=1e-5,
+        rms_norm=True,
+        residual_in_fp32=True,
+        fused_add_norm=fused_add_norm,
+        layer_idx=0,
+        rcps=True,
+        **factory_kwargs
+    )
+
+    # Test RC equivariance of wrapper
+    out = bert_block(x, residual=None)
+    rc_out = tuple([rc(r) for r in bert_block(rc_x, residual=None)])
+    for f, r in zip(out, rc_out):
+        assert f.size() == x.size()
+        assert r.size() == x.size()
+        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+
+    out = bert_block(x, residual=x)
+    rc_out = tuple([rc(r) for r in bert_block(rc_x, residual=rc_x)])
     for f, r in zip(out, rc_out):
         assert f.size() == x.size()
         assert r.size() == x.size()

@@ -36,6 +36,7 @@ class CaduceusConfig(PretrainedConfig):
             rcps: bool = False,
             gradient_checkpointing_stride: int = 1,
             complement_map: Optional[dict] = None,  # used for RCPSEmbedding / RCPSLMHead
+            transformer_ratio: float = 0.0,  # 0.0 = all mamba, 1.0 = all transformer
             **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,3 +56,7 @@ class CaduceusConfig(PretrainedConfig):
         self.rcps = rcps
         self.gradient_checkpointing_stride = gradient_checkpointing_stride
         self.complement_map = complement_map
+
+        if not 0 <= transformer_ratio <= 1:
+            raise ValueError(f"transformer_ratio must be between 0 and 1, got {transformer_ratio}")
+        self.transformer_ratio = transformer_ratio
