@@ -35,6 +35,7 @@ def bert_layer(config: CaduceusConfig) -> nn.Module:
         vocab_size=config.vocab_size,
         num_hidden_layers=2,
         num_attention_heads=4,
+        # Disabling dropout is crucial for RC invariance.
         hidden_dropout_prob=0,
         attention_probs_dropout_prob=0,
         is_decoder=False
@@ -115,6 +116,12 @@ def test_v1_v2_equivalence(device, n_batch):
     seq = torch.randn(n_batch, config.model_max_length, config.d_model).to(device)
     caduceus_v1 = get_caduceus_v1(config, device)
     caduceus_v2 = get_caduceus_v2(config, layers=[
+        # Tie the underlying Mamba layers together because Mamba only 
+        # makes it possible to initialize `dt_proj` with constants while all
+        # most other tensors are initialized randomly.  See:
+        # https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba_simple.py#L84-L89
+        # I also wasn't able to get a random seeding to make two consecutive
+        # instantiations deterministic.
         list(caduceus_v1)[i].mixer.submodule.mamba_fwd
         for i in range(config.n_layer)
     ], device=device)
@@ -134,4 +141,6 @@ def test_v2_rc_invariance(device, n_batch, n_layer, layer_type):
     config = get_config(n_layer=n_layer)
     seq = torch.randn(n_batch, config.model_max_length, config.d_model).to(device)
     caduceus_v2 = get_caduceus_v2(config, layers=layer_type, device=device)
+    # This is testing invariance rather than equivariance because, unless I'm mistaken,
+    # equivariance is trivial if you have invariance (i.e. the same results for a sequence and its RC).
     assert torch.equal(caduceus_v2(seq), caduceus_v2(rc(seq)))
