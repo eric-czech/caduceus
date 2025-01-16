@@ -5,10 +5,11 @@
 import inspect
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
 try:
     from mamba_ssm.modules.mamba_simple import Block  # Legacy mambav1 file structure
 except ImportError:
@@ -32,16 +33,17 @@ from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMa
 
 def create_block(
         d_model,
-        ssm_cfg=None,
-        norm_epsilon=1e-5,
-        rms_norm=False,
-        residual_in_fp32=False,
-        fused_add_norm=False,
-        layer_idx=None,
-        bidirectional=True,
-        bidirectional_strategy="add",
-        bidirectional_weight_tie=True,
-        rcps=False,
+        *,
+        ssm_cfg,
+        norm_epsilon,
+        rms_norm,
+        residual_in_fp32,
+        fused_add_norm,
+        layer_idx,
+        bidirectional,
+        bidirectional_strategy,
+        bidirectional_weight_tie,
+        rcps,
         device=None,
         dtype=None,
 ):
@@ -90,19 +92,26 @@ class BiMambaWrapper(nn.Module):
     def __init__(
             self,
             d_model: int,
+            mamba_version: Literal["v1", "v2"] = "v1",
             bidirectional: bool = True,
-            bidirectional_strategy: Optional[str] = "add",
+            bidirectional_strategy: Literal["add", "ew_multiply"] = "add",
             bidirectional_weight_tie: bool = True,
             **mamba_kwargs,
     ):
         super().__init__()
-        if bidirectional and bidirectional_strategy is None:
-            bidirectional_strategy = "add"  # Default strategy: `add`
-        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply"]:
-            raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
+        if bidirectional and bidirectional_strategy not in ("add", "ew_multiply"):
+            raise NotImplementedError(f"Unrecognized {bidirectional_strategy=!r}; must be one of ('add', 'ew_multiply')")
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
-        self.mamba_fwd = Mamba(
+
+        if mamba_version not in ("v1", "v2"):
+            raise NotImplementedError(f"Unrecognized {mamba_version=!r}; must be one of ('v1', 'v2')")
+        if mamba_version == "v1":
+            block_cls = Mamba
+        else:
+            block_cls = Mamba2
+        
+        self.mamba_fwd = block_cls(
             d_model=d_model,
             **mamba_kwargs
         )
@@ -173,7 +182,7 @@ class CaduceusMixerModel(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
 
-        self.fused_add_norm = config.fused_add_norm
+        self.fused_add_norm = config.norm_cfg.fused_add_norm
         self.rcps = config.rcps
         self.residual_in_fp32 = config.residual_in_fp32
 
@@ -184,7 +193,7 @@ class CaduceusMixerModel(nn.Module):
         # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
         # the main branch (output of MLP / Mixer). The model definition is unchanged.
         # This is for performance reason: we can fuse add + layer_norm.
-        if config.fused_add_norm:
+        if config.norm_cfg.fused_add_norm:
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
@@ -192,11 +201,11 @@ class CaduceusMixerModel(nn.Module):
             [
                 create_block(
                     config.d_model,
-                    ssm_cfg=config.ssm_cfg,
-                    norm_epsilon=config.norm_epsilon,
-                    rms_norm=config.rms_norm,
+                    ssm_cfg=config.layer_cfg.mamba_cfg.ssm_cfg,
+                    norm_epsilon=config.norm_cfg.norm_epsilon,
+                    rms_norm=config.norm_cfg.rms_norm,
                     residual_in_fp32=config.residual_in_fp32,
-                    fused_add_norm=config.fused_add_norm,
+                    fused_add_norm=config.norm_cfg.fused_add_norm,
                     layer_idx=i,
                     bidirectional=config.bidirectional,
                     bidirectional_strategy=config.bidirectional_strategy,
@@ -208,10 +217,10 @@ class CaduceusMixerModel(nn.Module):
             ]
         )
 
-        norm_f = (nn.LayerNorm if not config.rms_norm else RMSNorm)(
-            config.d_model, eps=config.norm_epsilon, **factory_kwargs
+        norm_f = (nn.LayerNorm if not config.norm_cfg.rms_norm else RMSNorm)(
+            config.d_model, eps=config.norm_cfg.norm_epsilon, **factory_kwargs
         )
-        self.norm_f = norm_f if (config.fused_add_norm or not config.rcps) else RCPSAddNormWrapper(norm_f)
+        self.norm_f = norm_f if (config.norm_cfg.fused_add_norm or not config.rcps) else RCPSAddNormWrapper(norm_f)
 
     def forward(self, input_ids, inputs_embeds=None, output_hidden_states=False):
         """Mixer forward."""
@@ -301,19 +310,16 @@ class CaduceusPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = False
     _no_split_modules = ["BiMambaWrapper"]
 
-    def _init_weights(
-            self,
-            module,
-            initializer_range=0.02,  # Now only used for embedding layer.
-            **kwargs,
-    ):
-        """Adapted from: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py"""
-
+    def _init_weights(self, module, **kwargs):
+        """Initialize weights.
+        
+        Adapted from: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py
+        """
         n_layer = self.config.n_layer
-        initialized_cfg = self.config.initializer_cfg if self.config.initializer_cfg is not None else {}
-        rescale_prenorm_residual = initialized_cfg.get("rescale_prenorm_residual", True)
-        initializer_range = initialized_cfg.get("initializer_range", initializer_range)
-        n_residuals_per_layer = initialized_cfg.get("n_residuals_per_layer", 1)
+        initialized_cfg = self.config.initializer_cfg
+        rescale_prenorm_residual = initialized_cfg.rescale_prenorm_residual
+        initializer_range = initialized_cfg.initializer_range
+        n_residuals_per_layer = initialized_cfg.n_residuals_per_layer
 
         if isinstance(module, nn.Linear):
             if module.bias is not None:
@@ -518,9 +524,9 @@ class CaduceusForSequenceClassification(CaduceusPreTrainedModel):
         self.post_init()
         self.init_scorer()
 
-    def init_scorer(self, initializer_range=0.02):
-        initializer_range = self.config.initializer_cfg.get("initializer_range", initializer_range) \
-            if self.config.initializer_cfg is not None else initializer_range
+    def init_scorer(self):
+        """Initialize the scoring head."""
+        initializer_range = self.config.initializer_cfg.initializer_range
         self.score.weight.data.normal_(std=initializer_range)
 
     def get_input_embeddings(self):
