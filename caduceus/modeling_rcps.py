@@ -132,23 +132,22 @@ class RCPSAddNormWrapper(RCPSWrapper):
 
 class RCPSMambaBlock(nn.Module):
     def __init__(
-            self,
-            dim,
-            mixer_cls,
-            norm_cls=nn.LayerNorm,
-            fused_add_norm=False,
-            residual_in_fp32=False,
-            device=None,  # Keep for consistency with original Mamba Block
-            dtype=None,  # Keep for consistency with original Mamba Block
+        self,
+        dim,
+        mixer_cls,
+        mlp_cls=nn.Identity,
+        norm_cls=nn.LayerNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
     ):
         """RCPS version of simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection.
 
-        Adapted from: https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py
+        Adapted from: https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/block.py
         """
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
-        self.mixer = RCPSWrapper(mixer_cls(dim))
+        self.mixer = RCPSWrapper(mixer_cls())
         norm_f = norm_cls(dim)
         self.norm = norm_f if fused_add_norm else RCPSAddNormWrapper(norm_f)
         if self.fused_add_norm:
