@@ -19,6 +19,23 @@ from caduceus.modeling_rcps import (
 from caduceus.modeling_caduceus import CaduceusConfig, CaduceusMixerModel, CaduceusForMaskedLM, create_block
 
 
+# These are the default configuration values for Mamba v1 as of:
+# https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba_simple.py#L31-L50
+MAMBA_CFG_V1_DEFAULT = {
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+    "dt_rank": "auto",
+    "dt_min": 0.001,
+    "dt_max": 0.1,
+    "dt_init": "random",
+    "dt_scale": 1.0,
+    "dt_init_floor": 1e-4,
+    "conv_bias": True,
+    "bias": False,
+    "use_fast_path": True
+}
+
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("seq_len", [512])
 @pytest.mark.parametrize("d_model", [256])
@@ -108,6 +125,8 @@ def test_rcps_wrapper(batch_size, seq_len, d_model, dtype):
 @pytest.mark.parametrize("d_model", [128])
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_rcps_add_norm_wrapper(batch_size, seq_len, d_model, dtype):
+    if RMSNorm is None:
+        pytest.skip("RMSNorm is not available")
     # Set tolerance
     device = torch.device("cuda")
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
@@ -151,16 +170,11 @@ def test_rcps_mamba_block_wrapper(batch_size, seq_len, d_model, bidirectional, f
     # Generate random sequence with 2 * d_model channels
     x = torch.randn(batch_size, seq_len, d_model * 2, device=device, dtype=dtype)
     rc_x = torch.flip(x, dims=[-2, -1])
-
-    ssm_cfg = {
-        "d_state": 16, "d_conv": 4, "expand": 2, "dt_rank": "auto", "dt_min": 0.001, "dt_max": 0.1, "dt_init": "random",
-        "dt_scale": 1.0, "dt_init_floor": 1e-4, "conv_bias": True, "bias": False, "use_fast_path": True
-    }
     factory_kwargs = {"device": device, "dtype": dtype}
 
     mamba_block = create_block(
         d_model,
-        ssm_cfg=ssm_cfg,
+        ssm_cfg=MAMBA_CFG_V1_DEFAULT,
         norm_epsilon=1e-5,
         rms_norm=True,
         residual_in_fp32=True,
@@ -276,15 +290,12 @@ def test_rcps_backbone(batch_size, seq_len, n_layer, d_model, dtype, fused_add_n
 
     # Setup CaduceusConfig
     initializer_cfg = {"initializer_range": 0.02, "rescale_prenorm_residual": True, "n_residuals_per_layer": 1}
-    ssm_cfg = {
-        "d_state": 16, "d_conv": 4, "expand": 2, "dt_rank": "auto", "dt_min": 0.001, "dt_max": 0.1, "dt_init": "random",
-        "dt_scale": 1.0, "dt_init_floor": 1e-4, "conv_bias": True, "bias": False, "use_fast_path": True
-    }
+
     config = CaduceusConfig(
         d_model=d_model,
         n_layer=n_layer,
         vocab_size=12,
-        ssm_cfg=ssm_cfg,
+        ssm_cfg=MAMBA_CFG_V1_DEFAULT,
         rms_norm=True,
         residual_in_fp32=False,
         fused_add_norm=fused_add_norm,
@@ -433,15 +444,11 @@ def test_collapse_invariance(batch_size, seq_len, n_layer, d_model, dtype, bidir
 
     # Setup CaduceusConfig
     initializer_cfg = {"initializer_range": 0.02, "rescale_prenorm_residual": True, "n_residuals_per_layer": 1}
-    ssm_cfg = {
-        "d_state": 16, "d_conv": 4, "expand": 2, "dt_rank": "auto", "dt_min": 0.001, "dt_max": 0.1, "dt_init": "random",
-        "dt_scale": 1.0, "dt_init_floor": 1e-4, "conv_bias": True, "bias": False, "use_fast_path": True
-    }
     config = CaduceusConfig(
         d_model=d_model,
         n_layer=n_layer,
         vocab_size=12,
-        ssm_cfg=ssm_cfg,
+        ssm_cfg=MAMBA_CFG_V1_DEFAULT,
         rms_norm=True,
         residual_in_fp32=False,
         fused_add_norm=True,

@@ -138,8 +138,7 @@ class RCPSMambaBlock(nn.Module):
             norm_cls=nn.LayerNorm,
             fused_add_norm=False,
             residual_in_fp32=False,
-            device=None,  # Keep for consistency with original Mamba Block
-            dtype=None,  # Keep for consistency with original Mamba Block
+            **kwargs
     ):
         """RCPS version of simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection.
 
@@ -156,6 +155,11 @@ class RCPSMambaBlock(nn.Module):
             assert isinstance(
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+        
+        # Warn about unused kwargs (e.g. device, dtype)
+        if kwargs:
+            import warnings
+            warnings.warn(f"Unused kwargs in RCPSMambaBlock: {list(kwargs.keys())}")
 
     def forward(
         self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
