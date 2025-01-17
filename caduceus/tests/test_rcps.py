@@ -3,15 +3,13 @@
 """
 
 from typing import Literal
+from caduceus.compat.mamba import get_mamba_version
 import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
-except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+from packaging.version import Version
+from caduceus.compat.mamba import RMSNorm
 
 from caduceus.modeling_rcps import (
     RCPSEmbedding, RCPSAddNormWrapper, RCPSLMHead, RCPSWrapper
@@ -36,14 +34,6 @@ def get_tokenized_inputs(str_to_id, complement_map, batch_size, seq_len, device)
     return input_ids, rc_input_ids
 
 def create_test_config(**kwargs):
-    """Create a CaduceusConfig with default test settings.
-    
-    Args:
-        **kwargs: Override any config parameters.
-        
-    Returns:
-        CaduceusConfig: Configuration object with test defaults.
-    """
     # Get tokenizer mappings
     _, complement_map = get_tokenizer_mappings()
 
@@ -66,6 +56,8 @@ def create_test_config(**kwargs):
         # `d_model * expand / headdim` is a multiple of 8 when
         # using the default `d_model` value set above. See:
         # https://github.com/state-spaces/mamba/issues/351#issuecomment-2167091940
+        # Current defaults as of Mamba v2.0.0 are headdim=64, expand=2. See:
+        # https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba2.py#L44-L45
         if "ssm_cfg" not in mamba_cfg:
             mamba_cfg["ssm_cfg"] = {"headdim": 32, "expand": 2}
 
@@ -96,7 +88,7 @@ def device():
     """Fixture to provide the compute device."""
     return torch.device("cuda")
 
-def mamba_dtype_supported(version: Literal["v1", "v2"], device: torch.device, dtype: torch.dtype) -> bool:
+def skip_if_mamba_dtype_not_supported(version: Literal["v1", "v2"], device: torch.device, dtype: torch.dtype) -> None:
     # Skip fp32 tests for Mamba v2 on older GPUs due to:
     # https://github.com/triton-lang/triton/issues/4813
     major, _ = torch.cuda.get_device_capability(device)
@@ -105,12 +97,18 @@ def mamba_dtype_supported(version: Literal["v1", "v2"], device: torch.device, dt
         and torch.finfo(dtype).bits >= torch.finfo(torch.float32).bits 
         and major < 8
     ):
-        return False
-    return True
-
-def skip_if_mamba_dtype_not_supported(version: Literal["v1", "v2"], device: torch.device, dtype: torch.dtype) -> None:
-    if not mamba_dtype_supported(version, device, dtype):
         pytest.skip("Mamba v2 fp32+ tests are not supported on this GPU")
+
+def skip_if_mamba_version_not_available(version: Literal["v1", "v2"]) -> None:
+    installed_version = get_mamba_version(raise_on_missing=True)
+    assert isinstance(installed_version, Version)
+    if installed_version.major < 2 and version == "v2":
+        pytest.skip("Mamba v2 not installed")
+
+def skip_if_mamba_incompatible(version: Literal["v1", "v2"], device: torch.device, dtype: torch.dtype) -> None:
+    skip_if_mamba_version_not_available(version)
+    skip_if_mamba_dtype_not_supported(version, device, dtype)
+
 
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("seq_len", [512])
@@ -194,7 +192,8 @@ def test_rcps_wrapper(device, batch_size, seq_len, d_model, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_rcps_add_norm_wrapper(device, batch_size, seq_len, d_model, dtype):
     if RMSNorm is None:
-        pytest.skip("RMSNorm is not available")
+        pytest.skip("Mamba Triton kernel for RMSNorm not available")
+
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
     if dtype == torch.bfloat16:
@@ -212,11 +211,9 @@ def test_rcps_add_norm_wrapper(device, batch_size, seq_len, d_model, dtype):
     # Test RC equivariance of wrapper
     rcps_module = RCPSAddNormWrapper(norm).to(device)
     out = rcps_module(x)
-    rc_out = tuple([torch.flip(r, dims=[-2, -1]) for r in rcps_module(rc_x)])
-    for f, r in zip(out, rc_out):
-        assert f.size() == x.size()
-        assert r.size() == x.size()
-        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+    rc_out = torch.flip(rcps_module(rc_x), dims=[-2, -1])
+    assert x.size() == out.size() == rc_out.size()
+    assert torch.allclose(out.detach(), rc_out.detach(), rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [2])
@@ -226,8 +223,10 @@ def test_rcps_add_norm_wrapper(device, batch_size, seq_len, d_model, dtype):
 @pytest.mark.parametrize("fused_add_norm", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("mamba_version", ["v1", "v2"])
-def test_rcps_mamba_block_wrapper(device, batch_size, seq_len, d_model, bidirectional, fused_add_norm, dtype, mamba_version):
-    skip_if_mamba_dtype_not_supported(mamba_version, device, dtype)
+@pytest.mark.parametrize("use_mamba_mlp", [True, False])
+def test_rcps_mamba_block_wrapper(device, batch_size, seq_len, d_model, bidirectional, fused_add_norm, dtype, mamba_version, use_mamba_mlp):
+    skip_if_mamba_incompatible(mamba_version, device, dtype)
+
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
     if dtype == torch.bfloat16:
@@ -246,7 +245,12 @@ def test_rcps_mamba_block_wrapper(device, batch_size, seq_len, d_model, bidirect
         bidirectional=bidirectional,
         bidirectional_weight_tie=True,
         norm_cfg=dict(fused_add_norm=fused_add_norm),
-        layer_cfg=dict(mamba_cfg=dict(version=mamba_version))
+        layer_cfg=dict(
+            mamba_cfg=dict(
+                **dict(version=mamba_version), 
+                **(dict(mlp_cfg=dict()) if use_mamba_mlp else {})
+            )
+        )
     )
     mamba_block = create_block(
         config=config,
@@ -281,7 +285,7 @@ def test_rcps_mamba_block_wrapper(device, batch_size, seq_len, d_model, bidirect
 @pytest.mark.parametrize("mamba_version", ["v1", "v2"])
 def test_rcps_backbone(device, batch_size, seq_len, n_layer, d_model, dtype, fused_add_norm,
                        bidirectional, bidirectional_weight_tie, mamba_version):
-    skip_if_mamba_dtype_not_supported(mamba_version, device, dtype)
+    skip_if_mamba_incompatible(mamba_version, device, dtype)
 
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
@@ -335,7 +339,7 @@ def test_rcps_backbone(device, batch_size, seq_len, n_layer, d_model, dtype, fus
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("mamba_version", ["v1", "v2"])
 def test_rcps_lm_head(device, batch_size, seq_len, d_model, dtype, mamba_version):
-    skip_if_mamba_dtype_not_supported(mamba_version, device, dtype)
+    skip_if_mamba_incompatible(mamba_version, device, dtype)
 
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
@@ -393,7 +397,7 @@ def test_rcps_lm_head(device, batch_size, seq_len, d_model, dtype, mamba_version
 @pytest.mark.parametrize("bidirectional_weight_tie", [False, True])
 @pytest.mark.parametrize("mamba_version", ["v1", "v2"])
 def test_rcps_mamba_lm(device, batch_size, seq_len, n_layer, d_model, dtype, bidirectional, bidirectional_weight_tie, mamba_version):
-    skip_if_mamba_dtype_not_supported(mamba_version, device, dtype)
+    skip_if_mamba_incompatible(mamba_version, device, dtype)
 
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
@@ -453,7 +457,7 @@ def test_rcps_mamba_lm(device, batch_size, seq_len, n_layer, d_model, dtype, bid
 @pytest.mark.parametrize("bidirectional_weight_tie", [True])
 @pytest.mark.parametrize("mamba_version", ["v1", "v2"])
 def test_collapse_invariance(device, batch_size, seq_len, n_layer, d_model, dtype, bidirectional, bidirectional_weight_tie, mamba_version):
-    skip_if_mamba_dtype_not_supported(mamba_version, device, dtype)
+    skip_if_mamba_incompatible(mamba_version, device, dtype)
 
     # Set tolerance
     rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)

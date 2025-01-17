@@ -14,20 +14,26 @@ ConfigType = Union[Dict[str, Any], T]
 class CaduceusMambaConfig(PretrainedConfig):
     """Configuration for Mamba SSM layers.
 
-    For example `ssm_cfg` options, see:
-      - v1: [mamba_ssm/modules/mamba_simple.py#L31-L50](https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba_simple.py#L31-L50)
-      - v2: [mamba_ssm/modules/mamba2.py#L37-L66](https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba2.py#L37-L66)
+    
+    Args:
+        version: Mamba version (default: "v2")
+        ssm_cfg: Optional SSM configuration (default: None); for `ssm_cfg` options see:
+            v1: [mamba_ssm/modules/mamba_simple.py#L31-L50](https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba_simple.py#L31-L50)
+            v2: [mamba_ssm/modules/mamba2.py#L37-L66](https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mamba2.py#L37-L66)
+        mlp_cfg: Optional MLP configuration (default: None); for `mlp_cfg` options (v2 only) see:
+            v2: [mamba_ssm/modules/mlp.py#L6-L17](https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mlp.py#L6-L17)
     """
     def __init__(
         self,
         version: Literal["v1", "v2"] = "v2",
         ssm_cfg: Optional[Dict[str, Any]] = None,
+        mlp_cfg: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.version = version
         self.ssm_cfg = ssm_cfg
-
+        self.mlp_cfg = mlp_cfg
 
 class CaduceusLayerConfig(PretrainedConfig):
     def __init__(
@@ -89,6 +95,9 @@ class CaduceusConfig(PretrainedConfig):
         rcps: Enable reverse-complement equivariance (default: False)
         complement_map: Token to complement mapping, required if rcps=True (default: None)
         
+        # Training Configuration
+        gradient_checkpointing_stride: Stride for gradient checkpointing (default: 1)
+
         # Component Configurations
         initializer_cfg: Weight initialization settings
             rescale_prenorm_residual: Rescale residuals by 1/√N (default: True)
@@ -135,6 +144,7 @@ class CaduceusConfig(PretrainedConfig):
         bidirectional_weight_tie: bool = True,
         rcps: bool = False,
         complement_map: Optional[Dict[str, Any]] = None,
+        gradient_checkpointing_stride: int = 1,
         initializer_cfg: Optional[ConfigType[CaduceusInitializerConfig]] = None,
         layer_cfg: Optional[ConfigType[CaduceusLayerConfig]] = None,
         norm_cfg: Optional[ConfigType[CaduceusNormConfig]] = None,
@@ -150,6 +160,7 @@ class CaduceusConfig(PretrainedConfig):
         self.bidirectional_weight_tie = bidirectional_weight_tie
         self.rcps = rcps
         self.complement_map = complement_map
+        self.gradient_checkpointing_stride = gradient_checkpointing_stride
 
         # Handle config objects that might be dictionaries for nested configs; see:
         # - Nesting config implementation: [transformers/configuration_utils.py#L891](https://github.com/huggingface/transformers/blob/v4.48.0/src/transformers/configuration_utils.py#L891)
@@ -161,10 +172,11 @@ class CaduceusConfig(PretrainedConfig):
         # Pre-condition checks
         if  self.bidirectional and self.bidirectional_strategy not in (vals := ("add", "ew_multiply")):
             raise NotImplementedError(f"Unrecognized {self.bidirectional_strategy=!r}; must be one of {vals}")
-        if self.layer_cfg.mode not in (vals := ("mamba-only", "mamba-rcps")):
+        if self.layer_cfg.mode not in (vals := ("mamba-only")):
             raise NotImplementedError(f"Unrecognized {self.layer_cfg.mode=!r}; must be one of {vals}")
         if self.layer_cfg.mamba_cfg.version not in (vals := ("v1", "v2")):
             raise NotImplementedError(f"Unrecognized {self.layer_cfg.mamba_cfg.version=!r}; must be one of {vals}")
+        if "out_features" in (self.layer_cfg.mamba_cfg.mlp_cfg or {}):
+            raise ValueError("Parameter `out_features` must not be set for `mlp_cfg` since it is inferred from `d_model`")
         if self.rcps and self.complement_map is None:
             raise ValueError("A `complement_map` must be provided if rcps=True")
-

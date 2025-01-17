@@ -2,31 +2,19 @@
 
 """
 
-import inspect
 import math
 from functools import partial
-from typing import Literal, Optional, Tuple, Union
+from typing import Any, Optional, Protocol, Tuple, Union
 
 import torch
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2 import Mamba2
-try:
-    from mamba_ssm.modules.mamba_simple import Block  # Legacy mambav1 file structure
-except ImportError:
-    from mamba_ssm.modules.block import Block  # mambav2 file structure
 from torch import nn
 from torch.nn import functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithNoAttention, MaskedLMOutput, SequenceClassifierOutput
 
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn  # Legacy mambav1 file structure
-except ImportError:
-    try:
-        from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn  # mambav2 file structure
-    except ImportError:
-        RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
+from .compat.mamba import Block as MambaBlock, GatedMLP as MambaMLP, RMSNorm, get_mamba_version, layer_norm_fn, rms_norm_fn
 from .configuration_caduceus import CaduceusConfig
 from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock
 
@@ -60,15 +48,25 @@ def create_block(
 
     # For reference on these arguments, see:
     # https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/block.py
-    block_cls = RCPSMambaBlock if config.rcps else Block
+    block_cls = RCPSMambaBlock if config.rcps else MambaBlock
     block_args = dict(
         dim=config.d_model,
         mixer_cls=mixer_cls,
         norm_cls=norm_cls,
-        mlp_cls=nn.Identity,
         fused_add_norm=config.norm_cfg.fused_add_norm,
         residual_in_fp32=config.residual_in_fp32,
     )
+    if get_mamba_version(raise_on_missing=True).major >= 2:
+        mlp_cfg = config.layer_cfg.mamba_cfg.mlp_cfg
+        if mlp_cfg is None:
+            mlp_cls = nn.Identity
+        else:
+            # For more details on Mamba's GatedMLP, see:
+            # https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/mlp.py#L6-L17
+            mlp_cls = partial(
+                MambaMLP, out_features=config.d_model, **mlp_cfg, **factory_kwargs
+            )
+        block_args["mlp_cls"] = mlp_cls
     block = block_cls(**block_args)
     block.layer_idx = layer_idx
     return block
@@ -79,6 +77,13 @@ class BiMambaWrapper(nn.Module):
 
     def __init__(
         self,
+        # This is typically referred to as `d_model`, but we use `dim`
+        # for compatibility with Mamba `mixer_cls` values that are invoked
+        # with a single positional argument called `dim`. See:
+        # https://github.com/state-spaces/mamba/blob/9182c93c9acb3e4ccac55a18a52c228d870d60bc/mamba_ssm/modules/block.py#L30
+        # `BiMambaWrapper` is used as a `mixer_cls` argument in `create_block`.
+        dim: int, 
+        *,
         config: CaduceusConfig,
         layer_idx: int,
         device=None,
@@ -98,7 +103,11 @@ class BiMambaWrapper(nn.Module):
         block_cls = Mamba2 if config.layer_cfg.mamba_cfg.version == "v2" else Mamba
         factory_kwargs = {"device": device, "dtype": dtype}
         mamba_kwargs = config.layer_cfg.mamba_cfg.ssm_cfg or {}
-        
+        if dim != config.d_model:
+            raise AssertionError(
+                f"Expected `dim` to be equal to `config.d_model`; "
+                f"got {dim=} and {config.d_model=}."
+            )
         self.mamba_fwd = block_cls(
             d_model=config.d_model,
             layer_idx=layer_idx,
@@ -164,7 +173,44 @@ class CaduceusEmbeddings(nn.Module):
         return self.word_embeddings(input_ids)
 
 
-class CaduceusMixerModel(nn.Module):
+class HFGCProtocol(Protocol):
+    """Protocol for modules that support gradient checkpointing with Hugging Face Transformers."""
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any]) -> None:
+        """Enable gradient checkpointing.
+        Args:
+            gradient_checkpointing_kwargs: Additional keyword arguments passed along to the `torch.utils.checkpoint.checkpoint` function.
+        
+        See Also:
+            - [Transformers Documentation - enable gradient checkpointing](https://huggingface.co/docs/transformers/en/main_classes/model#transformers.PreTrainedModel.gradient_checkpointing_enable)
+            - [Transformers Source - enable implementation](https://github.com/huggingface/transformers/blob/6bc0fbcfa7acb6ac4937e7456a76c2f7975fefec/src/transformers/modeling_utils.py#L2521)
+        """
+        ...
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable gradient checkpointing.
+        
+        See Also:
+            - [Transformers Documentation - disable gradient checkpointing](https://huggingface.co/docs/transformers/en/main_classes/model#transformers.PreTrainedModel.gradient_checkpointing_disable)
+            - [Transformers Source - disable implementation](https://github.com/huggingface/transformers/blob/6bc0fbcfa7acb6ac4937e7456a76c2f7975fefec/src/transformers/modeling_utils.py#L2585)
+        """
+        ...
+
+
+class MCGCProtocol(Protocol):
+    """Protocol for modules that support gradient checkpointing with MosaicML Composer."""
+
+    def activation_checkpointing_fn(self, module: nn.Module) -> bool:
+        """Determine if module should be checkpointed.
+        
+        See Also:
+            - [Composer Documentation - FSDP auto wrap policy](https://github.com/mosaicml/composer/blob/7fa03545cc2025f256d914abc111a068d239d632/docs/source/notes/distributed_training.rst#composers-fsdp-auto-wrap-policy)
+            - [MosaicML Examples - GPT implementation](https://github.com/mosaicml/examples/blob/6972fe3000d5a5480d8757ff710965514155e8db/llm/llm/gpt.py#L173-L175)
+        """
+        ...
+
+
+class CaduceusMixerModel(nn.Module, HFGCProtocol, MCGCProtocol):
     def __init__(
             self,
             config: CaduceusConfig,
@@ -189,6 +235,14 @@ class CaduceusMixerModel(nn.Module):
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
+        self.gradient_checkpointing = False
+        self.gradient_checkpointing_stride = config.gradient_checkpointing_stride
+        if not (1 <= config.gradient_checkpointing_stride <= config.n_layer):
+            raise ValueError(
+                f"`gradient_checkpointing_stride` must be between 1 and {config.n_layer}; "
+                f"got {config.gradient_checkpointing_stride=}."
+            )
+        
         self.layers = nn.ModuleList(
             [
                 create_block(
@@ -205,6 +259,27 @@ class CaduceusMixerModel(nn.Module):
         )
         self.norm_f = norm_f if (config.norm_cfg.fused_add_norm or not config.rcps) else RCPSAddNormWrapper(norm_f)
 
+    def _gradient_checkpointing_indexes(self) -> list[int]:
+        return [
+            i for i in range(len(self.layers)) 
+            if i % self.gradient_checkpointing_stride == 0
+        ]
+
+    def activation_checkpointing_fn(self, module: nn.Module) -> bool:
+        for index in self._gradient_checkpointing_indexes():
+            if self.layers[index] is module:
+                return True
+        return False
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any]) -> None:
+        self.gradient_checkpointing = True
+        self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.gradient_checkpointing = False
+        self.gradient_checkpointing_kwargs = None
+
+
     def forward(self, input_ids, inputs_embeds=None, output_hidden_states=False):
         """Mixer forward."""
         all_hidden_states = []
@@ -214,12 +289,19 @@ class CaduceusMixerModel(nn.Module):
             hidden_states = self.embeddings(input_ids)
 
         residual = None
-        for layer in self.layers:
+        checkpoint_indexes = set(self._gradient_checkpointing_indexes())
+        for index, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
-            # TODO: Add support for gradient checkpointing
-            hidden_states, residual = layer(
-                hidden_states, residual, inference_params=None
+            layer_fn = layer
+            if self.gradient_checkpointing and index in checkpoint_indexes:
+                layer_fn = partial(
+                    torch.utils.checkpoint.checkpoint, 
+                    layer, **self.gradient_checkpointing_kwargs
+                )
+            hidden_states, residual = layer_fn(
+                # Only positional args can be used for `torch.utils.checkpoint.checkpoint`
+                hidden_states, residual, None # inference_params=None
             )
 
         if not self.fused_add_norm:
@@ -290,7 +372,7 @@ class CaduceusPreTrainedModel(PreTrainedModel):
     """PreTrainedModel wrapper for Caduceus backbone."""
     config_class = CaduceusConfig
     base_model_prefix = "caduceus"
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
     _no_split_modules = ["BiMambaWrapper"]
 
     def _init_weights(self, module, **kwargs):
@@ -330,7 +412,7 @@ class CaduceusPreTrainedModel(PreTrainedModel):
                         p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
-class Caduceus(CaduceusPreTrainedModel):
+class Caduceus(CaduceusPreTrainedModel, HFGCProtocol):
     """Caduceus model that can be instantiated using HF patterns."""
     def __init__(self, config: CaduceusConfig, device=None, dtype=None, **kwargs):
         super().__init__(config)
@@ -348,6 +430,12 @@ class Caduceus(CaduceusPreTrainedModel):
         self.config = config
         factory_kwargs = {"device": device, "dtype": dtype}
         self.backbone = CaduceusMixerModel(config, **factory_kwargs, **kwargs)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any]) -> None:
+        self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.backbone.gradient_checkpointing_disable()
 
     def forward(
             self,
@@ -378,7 +466,7 @@ class Caduceus(CaduceusPreTrainedModel):
             return hidden_states
 
 
-class CaduceusForMaskedLM(CaduceusPreTrainedModel):
+class CaduceusForMaskedLM(CaduceusPreTrainedModel, HFGCProtocol):
     """HF-compatible Caduceus model for masked language modeling."""
 
     def __init__(self, config: CaduceusConfig, device=None, dtype=None, **kwargs):
@@ -402,6 +490,12 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any]) -> None:
+        self.caduceus.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.caduceus.gradient_checkpointing_disable()
 
     def get_input_embeddings(self):
         return self.caduceus.backbone.embeddings.word_embeddings
@@ -466,9 +560,9 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
         loss = None
         if labels is not None:
             if loss_weights is not None:
-                loss = weighted_cross_entropy(logits, labels, loss_weights, ignore_index=self.config.pad_token_id)
+                loss = weighted_cross_entropy(logits, labels, loss_weights)
             else:
-                loss = cross_entropy(logits, labels, ignore_index=self.config.pad_token_id)
+                loss = cross_entropy(logits, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -481,7 +575,7 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
         )
 
 
-class CaduceusForSequenceClassification(CaduceusPreTrainedModel):
+class CaduceusForSequenceClassification(CaduceusPreTrainedModel, HFGCProtocol):
     def __init__(
             self,
             config: CaduceusConfig,
@@ -507,8 +601,13 @@ class CaduceusForSequenceClassification(CaduceusPreTrainedModel):
         self.post_init()
         self.init_scorer()
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any]) -> None:
+        self.caduceus.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.caduceus.gradient_checkpointing_disable()
+
     def init_scorer(self):
-        """Initialize the scoring head."""
         initializer_range = self.config.initializer_cfg.initializer_range
         self.score.weight.data.normal_(std=initializer_range)
 

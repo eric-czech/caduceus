@@ -3,19 +3,12 @@
 """
 from collections import OrderedDict
 from typing import Optional
-
 import torch
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
+from .compat.mamba import RMSNorm, layer_norm_fn, rms_norm_fn
 
-try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn  # Legacy mambav1 file structure
-except ImportError:
-    try:
-        from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn  # mambav2 file structure
-    except ImportError:
-        RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
 class RCPSEmbedding(nn.Module):
@@ -147,14 +140,55 @@ class RCPSMambaBlock(nn.Module):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
-        self.mixer = RCPSWrapper(mixer_cls())
-        norm_f = norm_cls(dim)
-        self.norm = norm_f if fused_add_norm else RCPSAddNormWrapper(norm_f)
+        self.mixer = RCPSWrapper(mixer_cls(dim))
+        self.norm = norm_cls(dim)
+        if not fused_add_norm:
+            self.norm = RCPSAddNormWrapper(self.norm)
+
+        if mlp_cls is not nn.Identity:
+            self.norm2 = norm_cls(dim)
+            if not fused_add_norm:
+                self.norm2 = RCPSAddNormWrapper(self.norm2)
+            self.mlp = RCPSWrapper(mlp_cls(dim))
+        else:
+            self.mlp = None
+        
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
                 self.norm, (nn.LayerNorm, RMSNorm)
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+
+    def _apply_norm(self, norm: nn.Module, hidden_states: Tensor, residual: Optional[Tensor] = None) -> tuple[Tensor, Optional[Tensor]]:
+        if not self.fused_add_norm:
+            hidden_states, residual = self.norm(hidden_states, residual=residual, prenorm=True)
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+
+            hidden_states_fwd, residual_fwd = fused_add_norm_fn(
+                hidden_states[..., hidden_states.shape[-1] // 2:],
+                norm.weight,
+                norm.bias,
+                residual=residual[..., hidden_states.shape[-1] // 2:] if residual is not None else None,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=norm.eps,
+            )
+
+            hidden_states_rc, residual_rc = fused_add_norm_fn(
+                hidden_states[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]),
+                norm.weight,
+                norm.bias,
+                residual=residual[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]) if residual is not None else None,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=norm.eps,
+            )
+            hidden_states = torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
+            residual = torch.cat([residual_fwd, residual_rc.flip(dims=[-2, -1])], dim=-1)
+        return hidden_states, residual
 
     def forward(
         self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None
@@ -166,35 +200,13 @@ class RCPSMambaBlock(nn.Module):
             residual: hidden_states = Mixer(LN(residual)).
             inference_params: inference parameters for mixer.
         """
-        if not self.fused_add_norm:
-            hidden_states, residual = self.norm(hidden_states, residual=residual, prenorm=True)
-            if self.residual_in_fp32:
-                residual = residual.to(torch.float32)
-        else:
-            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
-
-            hidden_states_fwd, residual_fwd = fused_add_norm_fn(
-                hidden_states[..., hidden_states.shape[-1] // 2:],
-                self.norm.weight,
-                self.norm.bias,
-                residual=residual[..., hidden_states.shape[-1] // 2:] if residual is not None else None,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.norm.eps,
-            )
-
-            hidden_states_rc, residual_rc = fused_add_norm_fn(
-                hidden_states[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]),
-                self.norm.weight,
-                self.norm.bias,
-                residual=residual[..., :hidden_states.shape[-1] // 2].flip(dims=[-2, -1]) if residual is not None else None,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.norm.eps,
-            )
-            hidden_states = torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
-            residual = torch.cat([residual_fwd, residual_rc.flip(dims=[-2, -1])], dim=-1)
+        hidden_states, residual = self._apply_norm(self.norm, hidden_states, residual)
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+
+        if self.mlp is not None:
+            hidden_states, residual = self._apply_norm(self.norm2, hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
