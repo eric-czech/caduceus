@@ -1,27 +1,27 @@
-"""Character tokenizer for Hugging Face.
-
-"""
-
-from typing import List, Optional, Dict, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from transformers import PreTrainedTokenizer
+
+from .configuration_caduceus import validate_complement_map
 
 
 class CaduceusTokenizer(PreTrainedTokenizer):
     model_input_names = ["input_ids"]
 
-    def __init__(self,
-                 model_max_length: int,
-                 characters: Sequence[str] = ("A", "C", "G", "T", "N"),
-                 complement_map=None,
-                 bos_token="[BOS]",
-                 eos_token="[SEP]",
-                 sep_token="[SEP]",
-                 cls_token="[CLS]",
-                 pad_token="[PAD]",
-                 mask_token="[MASK]",
-                 unk_token="[UNK]",
-                 **kwargs):
+    def __init__(
+        self,
+        model_max_length: int,
+        characters: Sequence[str] = ("A", "C", "G", "T", "N"),
+        complement_map=None,
+        bos_token="[BOS]",
+        eos_token="[SEP]",
+        sep_token="[SEP]",
+        cls_token="[CLS]",
+        pad_token="[PAD]",
+        mask_token="[MASK]",
+        unk_token="[UNK]",
+        **kwargs
+    ):
         """Character tokenizer for Hugging Face transformers.
 
         Adapted from https://huggingface.co/LongSafari/hyenadna-tiny-1k-seqlen-hf/blob/main/tokenization_hyena.py
@@ -64,6 +64,7 @@ class CaduceusTokenizer(PreTrainedTokenizer):
         for k, v in self._vocab_str_to_int.items():
             complement_id = self._vocab_str_to_int[complement_map[k]] if k in complement_map.keys() else v
             self._complement_map[self._vocab_str_to_int[k]] = complement_id
+        validate_complement_map(self._complement_map)
 
         super().__init__(
             bos_token=bos_token,
@@ -88,7 +89,13 @@ class CaduceusTokenizer(PreTrainedTokenizer):
         return self._complement_map
 
     def _tokenize(self, text: str, **kwargs) -> List[str]:
-        return list(text.upper())  # Convert all base pairs to uppercase
+        tokens = []
+        for char in text.upper():
+            if char in self.characters:
+                tokens.append(char)
+            else:
+                tokens.append(self.unk_token)
+        return tokens
 
     def _convert_token_to_id(self, token: str) -> int:
         return self._vocab_str_to_int.get(token, self._vocab_str_to_int["[UNK]"])
@@ -121,7 +128,6 @@ class CaduceusTokenizer(PreTrainedTokenizer):
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None
     ) -> List[int]:
         sep = [self.sep_token_id]
-        # cls = [self.cls_token_id]
         result = token_ids_0 + sep
         if token_ids_1 is not None:
             result += token_ids_1 + sep

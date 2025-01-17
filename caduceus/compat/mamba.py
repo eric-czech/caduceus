@@ -1,5 +1,8 @@
-from importlib.metadata import PackageNotFoundError, version as pkg_version
-from packaging.version import parse, Version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
+
+from packaging.version import Version, parse
+
 
 def get_mamba_version(raise_on_missing: bool=False) -> Version | None:
     try:
@@ -22,23 +25,21 @@ def get_mamba_modules():
     """
     version = get_mamba_version()
     if version is None:
-        return (None,)*5
+        return (None,)*8
     if version.major < 2:
-        from mamba_ssm.modules.mamba_simple import Block
-        from mamba_ssm.ops.triton.layernorm import (  # v1 structure
-            RMSNorm, 
-            layer_norm_fn, 
-            rms_norm_fn
-        )
-        return Block, None, RMSNorm, layer_norm_fn, rms_norm_fn
+        from mamba_ssm.modules.mamba_simple import Block, Mamba
+        from mamba_ssm.ops.triton.layernorm import (RMSNorm,  # v1 structure
+                                                    layer_norm_fn, rms_norm_fn)
+        return Mamba, None, Block, None, None, RMSNorm, layer_norm_fn, rms_norm_fn
     else:
-        from mamba_ssm.modules.block import Block  
+        from mamba_ssm.modules.block import Block
+        from mamba_ssm.modules.mamba2 import Mamba2
+        from mamba_ssm.modules.mamba_simple import Mamba
+        from mamba_ssm.modules.mha import MHA
         from mamba_ssm.modules.mlp import GatedMLP
-        from mamba_ssm.ops.triton.layer_norm import (  # v2 structure
-            RMSNorm, 
-            layer_norm_fn, 
-            rms_norm_fn
-        )
-        return Block, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn
+        from mamba_ssm.ops.triton.layer_norm import (RMSNorm,  # v2 structure
+                                                     layer_norm_fn,
+                                                     rms_norm_fn)
+        return Mamba, Mamba2, Block, MHA, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn
 
-Block, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn = get_mamba_modules()
+Mamba, Mamba2, Block, MHA, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn = get_mamba_modules()
