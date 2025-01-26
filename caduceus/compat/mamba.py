@@ -1,0 +1,45 @@
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
+
+from packaging.version import Version, parse
+
+
+def get_mamba_version(raise_on_missing: bool=False) -> Version | None:
+    try:
+        
+        return parse(pkg_version('mamba-ssm'))
+    except PackageNotFoundError as e:
+        if raise_on_missing:
+            raise PackageNotFoundError(
+                "Failed to determine Mamba version. "
+                "Verify that `mamba-ssm` is installed."
+            ) from e
+        return None
+
+
+def get_mamba_modules():
+    """Get mamba normalization modules based on available version.
+    
+    Returns:
+        tuple: (Block, RMSNorm, layer_norm_fn, rms_norm_fn)
+    """
+    version = get_mamba_version()
+    if version is None:
+        return (None,)*8
+    if version.major < 2:
+        from mamba_ssm.modules.mamba_simple import Block, Mamba
+        from mamba_ssm.ops.triton.layernorm import (RMSNorm,  # v1 structure
+                                                    layer_norm_fn, rms_norm_fn)
+        return Mamba, None, Block, None, None, RMSNorm, layer_norm_fn, rms_norm_fn
+    else:
+        from mamba_ssm.modules.block import Block
+        from mamba_ssm.modules.mamba2 import Mamba2
+        from mamba_ssm.modules.mamba_simple import Mamba
+        from mamba_ssm.modules.mha import MHA
+        from mamba_ssm.modules.mlp import GatedMLP
+        from mamba_ssm.ops.triton.layer_norm import (RMSNorm,  # v2 structure
+                                                     layer_norm_fn,
+                                                     rms_norm_fn)
+        return Mamba, Mamba2, Block, MHA, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn
+
+Mamba, Mamba2, Block, MHA, GatedMLP, RMSNorm, layer_norm_fn, rms_norm_fn = get_mamba_modules()
