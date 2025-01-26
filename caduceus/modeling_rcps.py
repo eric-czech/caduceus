@@ -207,7 +207,7 @@ class RCPSMambaBlock(nn.Module):
 
 class RCPSLMHead(nn.Module):
     """LM Head for reverse-complement equivariant inputs, which have dim * 2 relative to standard inputs."""
-    def __init__(self, true_dim: int, vocab_size: int, complement_map: dict, **factory_kwargs):
+    def __init__(self, true_dim: int, vocab_size: int, complement_map: dict, flip_channels: bool = True, **factory_kwargs):
         """
         `true_dim` corresponds to the actual dimensionality of the input were it not reverse-complement
         equivariant, i.e. 0.5 times the actual input dim.
@@ -219,6 +219,7 @@ class RCPSLMHead(nn.Module):
         )
         self.true_dim = true_dim
         self.lm_head = nn.Linear(true_dim, vocab_size, bias=False, **factory_kwargs)
+        self.flip_channels = flip_channels
 
     @property
     def weight(self):
@@ -237,9 +238,16 @@ class RCPSLMHead(nn.Module):
         n_channels = x.shape[-1]
         assert n_channels == 2 * self.true_dim, "Input must have 2 * true_dim channels."
         fwd_logits = F.linear(x[..., :n_channels // 2], self.weight, bias=self.lm_head.bias)
-        rc_logits = F.linear(
-            torch.flip(x[..., n_channels // 2:], dims=[-1]),
-            self.weight[self.complement_map, :],
-            bias=self.lm_head.bias
-        )
+        if self.flip_channels:
+            rc_logits = F.linear(
+                torch.flip(x[..., n_channels // 2:], dims=[-1]),
+                self.weight[self.complement_map, :],
+                bias=self.lm_head.bias
+            )
+        else:
+            rc_logits = F.linear(
+                x[..., n_channels // 2:],
+                self.weight,
+                bias=self.lm_head.bias
+            )
         return fwd_logits + rc_logits

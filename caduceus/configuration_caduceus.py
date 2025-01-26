@@ -138,8 +138,10 @@ class CaduceusConfig(PretrainedConfig):
         initializer_cfg: Optional[ConfigType[CaduceusInitializerConfig]] = None,
         layer_cfg: Optional[ConfigType[CaduceusLayerConfig]] = None,
         norm_cfg: Optional[ConfigType[CaduceusNormConfig]] = None,
+        flip_lm_head_channels: bool = True,
+        **kwargs
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.d_model = d_model
         self.n_layer = n_layer
         self.vocab_size = vocab_size
@@ -150,6 +152,7 @@ class CaduceusConfig(PretrainedConfig):
         self.bidirectional_weight_tie = bidirectional_weight_tie
         self.rcps = rcps
         self.complement_map = complement_map
+        self.flip_lm_head_channels = flip_lm_head_channels
 
         # Handle config objects that might be dictionaries for nested configs; see:
         # - Nesting config implementation: [transformers/configuration_utils.py#L891](https://github.com/huggingface/transformers/blob/v4.48.0/src/transformers/configuration_utils.py#L891)
