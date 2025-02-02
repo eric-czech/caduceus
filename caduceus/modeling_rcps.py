@@ -216,9 +216,8 @@ class RCPSLMHead(nn.Module):
         super().__init__()
         self.register_buffer(
             "complement_map",
-            torch.tensor(list(OrderedDict(complement_map).values()), dtype=torch.long)
+            torch.tensor(list(OrderedDict(complement_map).values()), dtype=torch.long, device=factory_kwargs.get("device"))
         )
-        self.true_dim = true_dim
         self.lm_head = nn.Linear(true_dim, vocab_size, bias=False, **factory_kwargs)
 
     @property
@@ -235,12 +234,11 @@ class RCPSLMHead(nn.Module):
         Args:
             x: Input tensor of shape (batch_size, seq_len, dim), where dim = 2 * true_dim.
         """
-        n_channels = x.shape[-1]
-        assert n_channels == 2 * self.true_dim, "Input must have 2 * true_dim channels."
-        fwd_logits = F.linear(x[..., :n_channels // 2], self.weight, bias=self.lm_head.bias)
-        rc_logits = F.linear(
-            torch.flip(x[..., n_channels // 2:], dims=[-1]),
-            self.weight[self.complement_map, :],
-            bias=self.lm_head.bias
+        x_fwd, x_rev = torch.chunk(x, 2, dim=-1)
+        logits_fwd = self.lm_head(x_fwd)
+        logits_rev = self.lm_head(x_rev.flip(dims=[-2, -1]))
+        logits_rev = torch.index_select(
+            logits_rev.flip(dims=[-2]), dim=-1, 
+            index=self.complement_map
         )
-        return fwd_logits + rc_logits
+        return logits_fwd + logits_rev 
